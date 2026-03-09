@@ -1,0 +1,5 @@
+init/
+test/
+deploy.sh
+ncmedia
+!ncmedia/
