@@ -43,6 +43,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", heartbeatHandler)
 	mux.Handle("GET /download/{bucketName}/{objectName}", chainMiddlewares(downloadHandler(minioClient), authMiddleware))
+	mux.Handle("GET /info/{bucketName}/{objectName}", chainMiddlewares(getInfo(minioClient), authMiddleware))
 	mux.Handle("POST /upload/{bucketName}", chainMiddlewares(uploadHandler(minioClient), authMiddleware))
 
 	// setup middleware
@@ -233,37 +234,6 @@ func uploadHandler(minioClient *minio.Client) http.HandlerFunc {
 		}
 		defer file.Close()
 
-		bucketName := r.PathValue("bucketName")
-		overwrite, _ := strconv.ParseBool(r.URL.Query().Get("overwrite"))
-		// check if file already exists and overwrite is false
-		if !overwrite {
-			statObjectOptions := minio.StatObjectOptions{}
-			// set query params to stat object options
-			queryParams := r.URL.Query()
-			for key, values := range queryParams {
-				for _, value := range values {
-					statObjectOptions.SetReqParam(key, value)
-				}
-			}
-			// check if file exists
-			_, err := minioClient.StatObject(r.Context(), bucketName, fileHeader.Filename, statObjectOptions)
-			if err == nil {
-				resJSON(w, map[string]any{"message": "file already exists and skip overwrite"}, http.StatusOK)
-				return
-			}
-
-			errResponse := minio.ToErrorResponse(err)
-			// check if bucket not found
-			if errResponse.Code == minio.NoSuchBucket {
-				resJSON(w, errors.New("media not found"), http.StatusNotFound)
-				return
-			}
-			// check if file not found (expected error when file doesn't exist)
-			if errResponse.Code != minio.NoSuchKey {
-				panic(err)
-			}
-		}
-
 		mimeType := r.FormValue("mime_type")
 		// fallback to content type from header
 		if mimeType == "" {
@@ -276,11 +246,13 @@ func uploadHandler(minioClient *minio.Client) http.HandlerFunc {
 		if tags := r.FormValue("tags"); tags != "" {
 			putObjectOptions.UserTags = map[string]string{"owner": tags}
 		}
+
+		bucketName := r.PathValue("bucketName")
 		if _, err = minioClient.PutObject(r.Context(), bucketName, fileHeader.Filename, file, fileHeader.Size, putObjectOptions); err != nil {
 			errResponse := minio.ToErrorResponse(err)
 			// check if bucket not found
 			if errResponse.Code == minio.NoSuchBucket {
-				resJSON(w, errors.New("media not found"), http.StatusNotFound)
+				resJSON(w, errors.New("bucket not found"), http.StatusNotFound)
 				return
 			}
 			panic(err)
@@ -315,8 +287,12 @@ func downloadHandler(minioClient *minio.Client) http.HandlerFunc {
 		if err != nil {
 			errResponse := minio.ToErrorResponse(err)
 			// check if object or bucket not found
-			if errResponse.Code == minio.NoSuchKey || errResponse.Code == minio.NoSuchBucket {
-				resJSON(w, errors.New("media not found"), http.StatusNotFound)
+			switch errResponse.Code {
+			case minio.NoSuchKey:
+				resJSON(w, errors.New("object not found"), http.StatusNotFound)
+				return
+			case minio.NoSuchBucket:
+				resJSON(w, errors.New("bucket not found"), http.StatusNotFound)
 				return
 			}
 			panic(err)
@@ -329,5 +305,45 @@ func downloadHandler(minioClient *minio.Client) http.HandlerFunc {
 		if _, err := io.Copy(w, object); err != nil {
 			panic(err)
 		}
+	}
+}
+
+// getInfo handles getting object info
+func getInfo(minioClient *minio.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bucketName := r.PathValue("bucketName")
+		objectName := r.PathValue("objectName")
+		statObjectOptions := minio.StatObjectOptions{}
+
+		// set query params to stat object options
+		queryParams := r.URL.Query()
+		for key, values := range queryParams {
+			for _, value := range values {
+				statObjectOptions.SetReqParam(key, value)
+			}
+		}
+
+		// get object info
+		objectInfo, err := minioClient.StatObject(r.Context(), bucketName, objectName, statObjectOptions)
+		if err != nil {
+			errResponse := minio.ToErrorResponse(err)
+			// check if object or bucket not found
+			switch errResponse.Code {
+			case minio.NoSuchKey:
+				resJSON(w, errors.New("object not found"), http.StatusNotFound)
+				return
+			case minio.NoSuchBucket:
+				resJSON(w, errors.New("bucket not found"), http.StatusNotFound)
+				return
+			}
+			panic(err)
+		}
+
+		resJSON(w, map[string]any{
+			"name":          objectInfo.Key,
+			"content_type":  objectInfo.ContentType,
+			"size":          objectInfo.Size,
+			"last_modified": objectInfo.LastModified,
+		}, http.StatusOK)
 	}
 }
